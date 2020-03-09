@@ -502,9 +502,8 @@ compile_regex :: proc(regex :string) -> (table :[]Table_Entry)
     tokens := token_stack.elements[0 : regex_length];
 
     // double the length to account for the implicit concat(.) operator
-    // and plus one to account for the success state(#)
-    max_nodes := regex_length * 2 + 1;
-    max_operands := regex_length + 1;
+    max_nodes := regex_length * 2;
+    max_operands := regex_length;
 
     nodes := make_stack(Node, max_nodes);
 
@@ -1111,9 +1110,8 @@ main :: proc()
 
     { // matching
         regex := compile_regex("abc((def|[ghi])*|( \\w+)+\\. and this is to go even further beyond.)");
-        start := time.now();
 
-        
+        start := time.now();
 
         for i :i64 = 0; i < iter; i += 1
         {
