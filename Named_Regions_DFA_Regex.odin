@@ -823,7 +823,7 @@ compile_regex :: proc(regex :string) -> (table :[]Table_Entry)
         if DEBUG do fmt.println("Table generation finished!");
     }
 
-    if DEBUG && false
+    if DEBUG
     {
         print_character :: proc(character :Character)
         {
@@ -1134,10 +1134,10 @@ DEBUG :: true;
 
 main :: proc()
 {
-    iter :i64 = 1_000_000;
+    iter :i64 = 1_000;
     if DEBUG do iter = 1;
 
-    //if !DEBUG // 10k wide regex
+    if !DEBUG // 10k wide regex
     { 
         start := time.now();
 
