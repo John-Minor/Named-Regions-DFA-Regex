@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:time"
 import "core:runtime"
 import "core:unicode"
+import "core:mem"
 
 Stack :: struct(T :typeid)
 {
@@ -11,13 +12,23 @@ Stack :: struct(T :typeid)
     elements :[]T,
 }
 
-// if these stack functions are inlined the program will always crash during the set up phase for lexing
-make_stack :: inline proc($T :typeid, len :int, allocator := context.temp_allocator) -> (stack :Stack(T))
+// if these stack functions are inlined the program will always crash during the set up phase for lexing when using anything but -opt:0
+make_stack :: inline proc($T :typeid, len :int, allocator := context.allocator) -> (stack :Stack(T))
 {
     using stack;
     head = 0;
     elements = make([]T, len, allocator);
     return;
+}
+
+make_temp_stack :: inline proc($T :typeid, len :int, allocator := context.temp_allocator) -> Stack(T)
+{
+    return make_stack(T, len, allocator);
+}
+
+delete_stack :: inline proc(stack :Stack($T))
+{
+    delete(stack.elements);
 }
 
 push :: inline proc(using stack :^Stack($T), element :T)
@@ -26,23 +37,42 @@ push :: inline proc(using stack :^Stack($T), element :T)
     head += 1;
 }
 
-pop :: inline proc(using stack :^Stack($T)) -> (element :T)
+pop :: inline proc(using stack :^Stack($T)) -> T
 {
     head -= 1;
-    element = elements[head];
-    return;
+    return elements[head];
 }
 
-peek :: inline proc(using stack :^Stack($T)) -> (element :T)
+peek :: inline proc(using stack :^Stack($T)) -> T
 {
-    element = elements[head - 1];
-    return;
+    return elements[head - 1];
 }
 
-peek_pointer :: inline proc(using stack :^Stack($T)) -> (element :^T)
+peek_pointer :: inline proc(using stack :^Stack($T)) -> ^T
 {
-    element = &elements[head - 1];
-    return;
+    return &elements[head - 1];
+}
+
+push_unsafe :: inline proc(using stack :^Stack($T), element :T)
+{
+    #no_bounds_check elements[head] = element;
+    head += 1;
+}
+
+pop_unsafe :: inline proc(using stack :^Stack($T)) -> T
+{
+    head -= 1;
+    return #no_bounds_check elements[head];
+}
+
+peek_unsafe :: inline proc(using stack :^Stack($T)) -> T
+{
+    return #no_bounds_check elements[head - 1];
+}
+
+peek_pointer_unsafe :: inline proc(using stack :^Stack($T)) -> ^T
+{
+    return #no_bounds_check &elements[head - 1];
 }
 
 Character_Type :: enum
@@ -131,8 +161,9 @@ CONCAT_NODE :: Node{operation = .CONCAT, precedence = .CONCAT};
 
 Transition :: struct
 {
-    condition :Token,
+    character_value :Character_Value,
     jump :int,
+    region_name :u128,
 }
 
 Table_Entry :: struct
@@ -140,13 +171,7 @@ Table_Entry :: struct
     transitions :[]Transition,
 }
 
-make_table_entry :: inline proc(transition_count :int, allocator := context.allocator) -> (entry :Table_Entry)
-{
-    entry.transitions = make([]Transition, transition_count, allocator);
-    return;
-}
-
-b32_slice :: proc(text :[]u8) -> (out :u128)
+to_region32_slice :: proc(text :[]u8) -> (out :u128)
 {
     for character, index in text
     {
@@ -156,53 +181,49 @@ b32_slice :: proc(text :[]u8) -> (out :u128)
     return;
 }
 
-b32_string :: proc(text :string) -> (out :u128)
+to_region32_string :: proc(text :string) -> (out :u128)
 {
     for character, index in text
     {
         to_bits :u128 = cast(u128)character & 0b000_11111;
         out |= to_bits << cast(u128)(5 * index);
     }
-
     return;
 }
 
-to_b32 :: proc{b32_slice, b32_string};
+to_region32 :: proc{to_region32_slice, to_region32_string};
 
-from_b32 :: proc(value :u128) -> (out :[]rune)
+from_region32 :: proc(value :u128) -> []rune
 {
-    stack := make_stack(rune, 25);
+    stack := make_temp_stack(rune, 25);
     for i := 0; i < 26; i += 1
     {
         character := cast(u8)(0b011_00000 | (0b000_11111 & (value >> cast(u128)(5 * i))));
         if character == 0b011_11111 do character = 0b010_11111;
         if character == 0b011_00000 do break;
-        push(&stack, cast(rune)character);
+        push_unsafe(&stack, cast(rune)character);
     }
-    out = stack.elements[0 : stack.head];
-    return;
+    return #no_bounds_check stack.elements[0 : stack.head];
 }
 
 compile_regex :: proc(regex :string) -> (table :[]Table_Entry)
 {
-    name_start, name_accept := to_b32("start"), to_b32("accept");
-
     regex_length := len(regex) + 4; // the 4 is because of the 4 characters in: "s(" + regex + ")#"
+    if regex_length % 2 != 0 do regex_length += 1; // for some reason the program crashes during lexing if this value is odd and you use anything but -opt:0
 
-    if regex_length % 2 != 0 do regex_length += 1; // for some reason the program crashes during lexing if this value is odd
+    if DEBUG do fmt.println("Regex length:", regex_length, "\n");
 
-    if DEBUG do fmt.println("Regex length:", regex_length);
-
-    token_stack := make_stack(Token, regex_length);
+    token_stack := make_temp_stack(Token, regex_length);
 
     { // lexing
         if DEBUG do fmt.println("Lexing started!");
 
         // always crashes here on -opt:1
-        push(&token_stack, Token{Character{'S', 0, .EXACT}, token_stack.head, name_start});
-        push(&token_stack, Token{Character{'(', 0, .NON_MATCHING}, token_stack.head, 0});
+        // concat "s(" to the beginning of the regex where 's' has the region name "start"
+        push_unsafe(&token_stack, Token{Character{'S', 0, .EXACT}, token_stack.head, to_region32("start")});
+        push_unsafe(&token_stack, Token{Character{'(', 0, .NON_MATCHING}, token_stack.head, 0});
 
-        Lex_State :: enum i8
+        Lex_State :: enum
         {
             NORMAL,
             NAMING,
@@ -214,153 +235,134 @@ compile_regex :: proc(regex :string) -> (table :[]Table_Entry)
         };
         state := Lex_State.NORMAL;
 
-        region_name_stack := make_stack(u128, regex_length);
+        region_accumulator_stack := make_temp_stack(u8, 25);
+        region_names_stack := make_temp_stack(u128, regex_length/2);
         // crashes here on -opt:2 and -opt:3 if the regex_length variable is an odd value
-        push(&region_name_stack, 0);
-        region_stack := make_stack(u8, 25);
+        push_unsafe(&region_names_stack, 0);
 
-        class_stack := make_stack(Character, regex_length);
+        class_stack := make_temp_stack(Character, regex_length);
         negated := false;
-
 
         for current_rune in regex
         {
             switch state
             {
                 case .NORMAL:
-                    if DEBUG do fmt.println(state, current_rune);
-
-                    switch current_rune
+                    switch
                     {
-                        case '{':
+                        case current_rune == '{':
                             state = .NAMING;
-                            region_stack.head = 0;
+                            region_accumulator_stack.head = 0;
                         
-                        case '}':
-                            pop(&region_name_stack);
+                        case current_rune == '}':
+                            pop_unsafe(&region_names_stack);
 
-                        case '\\':
+                        case current_rune == '\\':
                             state = .ESCAPE;
 
-                        case '[':
+                        case current_rune == '[':
                             state = .CLASS_START;
                             class_stack.head = 0;
                             negated = false;
 
-                        case '(':
-                            push(&token_stack, Token{Character{current_rune, 0, .NON_MATCHING}, token_stack.head, peek(&region_name_stack)});
+                        case current_rune == '('
+                        || current_rune == ')'
+                        || current_rune == '|'
+                        || current_rune == '*'
+                        || current_rune == '?'
+                        || current_rune == '+':
+                            push_unsafe(&token_stack, Token{Character{current_rune, 0, .NON_MATCHING}, token_stack.head, peek_unsafe(&region_names_stack)});
 
-                        case ')':
-                            push(&token_stack, Token{Character{current_rune, 0, .NON_MATCHING}, token_stack.head, peek(&region_name_stack)});
-
-                        case '|':
-                            push(&token_stack, Token{Character{current_rune, 0, .NON_MATCHING}, token_stack.head, peek(&region_name_stack)});
-
-                        case '*':
-                            push(&token_stack, Token{Character{current_rune, 0, .NON_MATCHING}, token_stack.head, peek(&region_name_stack)});
-
-                        case '?':
-                            push(&token_stack, Token{Character{current_rune, 0, .NON_MATCHING}, token_stack.head, peek(&region_name_stack)});
-
-                        case '+':
-                            push(&token_stack, Token{Character{current_rune, 0, .NON_MATCHING}, token_stack.head, peek(&region_name_stack)});
-
-                        case '.':
-                            push(&token_stack, Token{Character{current_rune, 0, .NOT_VERTICAL_WHITESPACE}, token_stack.head, peek(&region_name_stack)});
+                        case current_rune == '.':
+                            push_unsafe(&token_stack, Token{Character{current_rune, 0, .NOT_VERTICAL_WHITESPACE}, token_stack.head, peek_unsafe(&region_names_stack)});
 
                         case:
-                            push(&token_stack, Token{Character{current_rune, 0, .EXACT}, token_stack.head, peek(&region_name_stack)});
+                            push_unsafe(&token_stack, Token{Character{current_rune, 0, .EXACT}, token_stack.head, peek_unsafe(&region_names_stack)});
                     }
 
                 case .NAMING:
-                    if DEBUG do fmt.println(state, current_rune);
-
                     switch current_rune
                     {
                         case ':':
                             state = .NORMAL;
-                            push(&region_name_stack, to_b32(region_stack.elements[0 : region_stack.head]));
+                            push_unsafe(&region_names_stack, to_region32(#no_bounds_check region_accumulator_stack.elements[0 : region_accumulator_stack.head]));
 
                         case:
-                            push(&region_stack, cast(u8)current_rune);
+                            push_unsafe(&region_accumulator_stack, cast(u8)current_rune);
                     }
 
                 case .ESCAPE:
-                    if DEBUG do fmt.println(state, current_rune);
-
                     state = .NORMAL;
                     switch current_rune
                     {
                         case 'd':
-                            push(&token_stack, Token{Character{current_rune, 0, .NUM}, token_stack.head, peek(&region_name_stack)});
+                            push_unsafe(&token_stack, Token{Character{current_rune, 0, .NUM}, token_stack.head, peek_unsafe(&region_names_stack)});
 
                         case 'D':
-                            push(&token_stack, Token{Character{current_rune, 0, .NOT_NUM}, token_stack.head, peek(&region_name_stack)});
+                            push_unsafe(&token_stack, Token{Character{current_rune, 0, .NOT_NUM}, token_stack.head, peek_unsafe(&region_names_stack)});
 
                         case 'l':
-                            push(&token_stack, Token{Character{current_rune, 0, .LOWER}, token_stack.head, peek(&region_name_stack)});
+                            push_unsafe(&token_stack, Token{Character{current_rune, 0, .LOWER}, token_stack.head, peek_unsafe(&region_names_stack)});
 
                         case 'L':
-                            push(&token_stack, Token{Character{current_rune, 0, .NOT_LOWER}, token_stack.head, peek(&region_name_stack)});
+                            push_unsafe(&token_stack, Token{Character{current_rune, 0, .NOT_LOWER}, token_stack.head, peek_unsafe(&region_names_stack)});
 
                         case 'u':
-                            push(&token_stack, Token{Character{current_rune, 0, .UPPER}, token_stack.head, peek(&region_name_stack)});
+                            push_unsafe(&token_stack, Token{Character{current_rune, 0, .UPPER}, token_stack.head, peek_unsafe(&region_names_stack)});
 
                         case 'U':
-                            push(&token_stack, Token{Character{current_rune, 0, .NOT_UPPER}, token_stack.head, peek(&region_name_stack)});
+                            push_unsafe(&token_stack, Token{Character{current_rune, 0, .NOT_UPPER}, token_stack.head, peek_unsafe(&region_names_stack)});
 
                         case 'w':
-                            push(&token_stack, Token{Character{current_rune, 0, .WORD}, token_stack.head, peek(&region_name_stack)});
+                            push_unsafe(&token_stack, Token{Character{current_rune, 0, .WORD}, token_stack.head, peek_unsafe(&region_names_stack)});
 
                         case 'W':
-                            push(&token_stack, Token{Character{current_rune, 0, .NOT_WORD}, token_stack.head, peek(&region_name_stack)});
+                            push_unsafe(&token_stack, Token{Character{current_rune, 0, .NOT_WORD}, token_stack.head, peek_unsafe(&region_names_stack)});
 
                         case 's':
-                            push(&token_stack, Token{Character{current_rune, 0, .WHITESPACE}, token_stack.head, peek(&region_name_stack)});
+                            push_unsafe(&token_stack, Token{Character{current_rune, 0, .WHITESPACE}, token_stack.head, peek_unsafe(&region_names_stack)});
 
                         case 'S':
-                            push(&token_stack, Token{Character{current_rune, 0, .NOT_WHITESPACE}, token_stack.head, peek(&region_name_stack)});
+                            push_unsafe(&token_stack, Token{Character{current_rune, 0, .NOT_WHITESPACE}, token_stack.head, peek_unsafe(&region_names_stack)});
 
                         case 'v':
-                            push(&token_stack, Token{Character{current_rune, 0, .VERTICAL_WHITESPACE}, token_stack.head, peek(&region_name_stack)});
+                            push_unsafe(&token_stack, Token{Character{current_rune, 0, .VERTICAL_WHITESPACE}, token_stack.head, peek_unsafe(&region_names_stack)});
 
                         case 'V':
-                            push(&token_stack, Token{Character{current_rune, 0, .NOT_VERTICAL_WHITESPACE}, token_stack.head, peek(&region_name_stack)});
+                            push_unsafe(&token_stack, Token{Character{current_rune, 0, .NOT_VERTICAL_WHITESPACE}, token_stack.head, peek_unsafe(&region_names_stack)});
 
                         case 'h':
-                            push(&token_stack, Token{Character{current_rune, 0, .HORIZONTAL_WHITESPACE}, token_stack.head, peek(&region_name_stack)});
+                            push_unsafe(&token_stack, Token{Character{current_rune, 0, .HORIZONTAL_WHITESPACE}, token_stack.head, peek_unsafe(&region_names_stack)});
 
                         case 'H':
-                            push(&token_stack, Token{Character{current_rune, 0, .NOT_HORIZONTAL_WHITESPACE}, token_stack.head, peek(&region_name_stack)});
+                            push_unsafe(&token_stack, Token{Character{current_rune, 0, .NOT_HORIZONTAL_WHITESPACE}, token_stack.head, peek_unsafe(&region_names_stack)});
 
                         case 'a': // bell
-                            push(&token_stack, Token{Character{'\a', 0, .EXACT}, token_stack.head, peek(&region_name_stack)});
+                            push_unsafe(&token_stack, Token{Character{'\a', 0, .EXACT}, token_stack.head, peek_unsafe(&region_names_stack)});
 
                         case 'b': // backspace
-                            push(&token_stack, Token{Character{'\b', 0, .EXACT}, token_stack.head, peek(&region_name_stack)});
+                            push_unsafe(&token_stack, Token{Character{'\b', 0, .EXACT}, token_stack.head, peek_unsafe(&region_names_stack)});
 
                         case 't': // tab
-                            push(&token_stack, Token{Character{'\t', 0, .EXACT}, token_stack.head, peek(&region_name_stack)});
+                            push_unsafe(&token_stack, Token{Character{'\t', 0, .EXACT}, token_stack.head, peek_unsafe(&region_names_stack)});
 
                         case 'r': // carriage return
-                            push(&token_stack, Token{Character{'\r', 0, .EXACT}, token_stack.head, peek(&region_name_stack)});
+                            push_unsafe(&token_stack, Token{Character{'\r', 0, .EXACT}, token_stack.head, peek_unsafe(&region_names_stack)});
 
                         case 'f': // form feed
-                            push(&token_stack, Token{Character{'\f', 0, .EXACT}, token_stack.head, peek(&region_name_stack)});
+                            push_unsafe(&token_stack, Token{Character{'\f', 0, .EXACT}, token_stack.head, peek_unsafe(&region_names_stack)});
 
                         case 'n': // new line
-                            push(&token_stack, Token{Character{'\n', 0, .EXACT}, token_stack.head, peek(&region_name_stack)});
+                            push_unsafe(&token_stack, Token{Character{'\n', 0, .EXACT}, token_stack.head, peek_unsafe(&region_names_stack)});
 
                         case 'e': // escape
-                            push(&token_stack, Token{Character{'\e', 0, .EXACT}, token_stack.head, peek(&region_name_stack)});
+                            push_unsafe(&token_stack, Token{Character{'\e', 0, .EXACT}, token_stack.head, peek_unsafe(&region_names_stack)});
 
                         case:
-                            push(&token_stack, Token{Character{current_rune, 0, .EXACT}, token_stack.head, peek(&region_name_stack)});
+                            push_unsafe(&token_stack, Token{Character{current_rune, 0, .EXACT}, token_stack.head, peek_unsafe(&region_names_stack)});
                     }
 
                 case .CLASS_START:
-                    if DEBUG do fmt.println(state, current_rune);
-
                     switch current_rune
                     {
                         case '^':
@@ -371,22 +373,20 @@ compile_regex :: proc(regex :string) -> (table :[]Table_Entry)
                             state = .CLASS_ESCAPE;
 
                         case '.':
-                            push(&class_stack, Character{current_rune, 0, .NOT_VERTICAL_WHITESPACE});
+                            push_unsafe(&class_stack, Character{current_rune, 0, .NOT_VERTICAL_WHITESPACE});
 
                         case ']':
                             state = .NORMAL;
                             temp_slice := make([]Character, class_stack.head, context.temp_allocator);
-                            runtime.copy_slice(temp_slice, class_stack.elements[0 : class_stack.head]);
-                            push(&token_stack, Token{Character_Class{temp_slice, negated}, token_stack.head, peek(&region_name_stack)});
+                            runtime.copy_slice(temp_slice, #no_bounds_check class_stack.elements[0 : class_stack.head]);
+                            push_unsafe(&token_stack, Token{Character_Class{temp_slice, negated}, token_stack.head, peek_unsafe(&region_names_stack)});
 
                         case:
                             state = .CLASS;
-                            push(&class_stack, Character{current_rune, 0, .EXACT});
+                            push_unsafe(&class_stack, Character{current_rune, 0, .EXACT});
                     }
 
                 case .CLASS:
-                    if DEBUG do fmt.println(state, current_rune);
-
                     switch current_rune
                     {
                         case '-':
@@ -396,162 +396,157 @@ compile_regex :: proc(regex :string) -> (table :[]Table_Entry)
                             state = .CLASS_ESCAPE;
 
                         case '.':
-                            push(&class_stack, Character{current_rune, 0, .NOT_VERTICAL_WHITESPACE});
+                            push_unsafe(&class_stack, Character{current_rune, 0, .NOT_VERTICAL_WHITESPACE});
 
                         case ']':
                             state = .NORMAL;
                             temp_slice := make([]Character, class_stack.head, context.temp_allocator);
-                            runtime.copy_slice(temp_slice, class_stack.elements[0 : class_stack.head]);
-                            push(&token_stack, Token{Character_Class{temp_slice, negated}, token_stack.head, peek(&region_name_stack)});
+                            runtime.copy_slice(temp_slice, #no_bounds_check class_stack.elements[0 : class_stack.head]);
+                            push_unsafe(&token_stack, Token{Character_Class{temp_slice, negated}, token_stack.head, peek_unsafe(&region_names_stack)});
 
 
                         case:
-                            push(&class_stack, Character{current_rune, 0, .EXACT});
+                            push_unsafe(&class_stack, Character{current_rune, 0, .EXACT});
                     }
 
                 case .CLASS_RANGE:
-                    if DEBUG do fmt.println(state, current_rune);
-
                     state = .CLASS;
-                    character := &class_stack.elements[class_stack.head - 1];
+                    character := #no_bounds_check &class_stack.elements[class_stack.head - 1];
                     character.max_rune = current_rune;
                     character.type = .RANGE;
 
                 case .CLASS_ESCAPE:
-                    if DEBUG do fmt.println(state, current_rune);
-
                     state = .CLASS;
                     switch current_rune
                     {
                         case 'd':
-                            push(&class_stack, Character{current_rune, 0, .NUM});
+                            push_unsafe(&class_stack, Character{current_rune, 0, .NUM});
 
                         case 'D':
-                            push(&class_stack, Character{current_rune, 0, .NOT_NUM});
+                            push_unsafe(&class_stack, Character{current_rune, 0, .NOT_NUM});
 
                         case 'l':
-                            push(&class_stack, Character{current_rune, 0, .LOWER});
+                            push_unsafe(&class_stack, Character{current_rune, 0, .LOWER});
 
                         case 'L':
-                            push(&class_stack, Character{current_rune, 0, .NOT_LOWER});
+                            push_unsafe(&class_stack, Character{current_rune, 0, .NOT_LOWER});
 
                         case 'u':
-                            push(&class_stack, Character{current_rune, 0, .UPPER});
+                            push_unsafe(&class_stack, Character{current_rune, 0, .UPPER});
 
                         case 'U':
-                            push(&class_stack, Character{current_rune, 0, .NOT_UPPER});
+                            push_unsafe(&class_stack, Character{current_rune, 0, .NOT_UPPER});
 
                         case 'w':
-                            push(&class_stack, Character{current_rune, 0, .WORD});
+                            push_unsafe(&class_stack, Character{current_rune, 0, .WORD});
 
                         case 'W':
-                            push(&class_stack, Character{current_rune, 0, .NOT_WORD});
+                            push_unsafe(&class_stack, Character{current_rune, 0, .NOT_WORD});
 
                         case 's':
-                            push(&class_stack, Character{current_rune, 0, .WHITESPACE});
+                            push_unsafe(&class_stack, Character{current_rune, 0, .WHITESPACE});
 
                         case 'S':
-                            push(&class_stack, Character{current_rune, 0, .NOT_WHITESPACE});
+                            push_unsafe(&class_stack, Character{current_rune, 0, .NOT_WHITESPACE});
 
                         case 'v':
-                            push(&class_stack, Character{current_rune, 0, .VERTICAL_WHITESPACE});
+                            push_unsafe(&class_stack, Character{current_rune, 0, .VERTICAL_WHITESPACE});
 
                         case 'V':
-                            push(&class_stack, Character{current_rune, 0, .NOT_VERTICAL_WHITESPACE});
+                            push_unsafe(&class_stack, Character{current_rune, 0, .NOT_VERTICAL_WHITESPACE});
 
                         case 'h':
-                            push(&class_stack, Character{current_rune, 0, .HORIZONTAL_WHITESPACE});
+                            push_unsafe(&class_stack, Character{current_rune, 0, .HORIZONTAL_WHITESPACE});
 
                         case 'H':
-                            push(&class_stack, Character{current_rune, 0, .NOT_HORIZONTAL_WHITESPACE});
+                            push_unsafe(&class_stack, Character{current_rune, 0, .NOT_HORIZONTAL_WHITESPACE});
 
                         case 'a': // bell
-                            push(&class_stack, Character{'\a', 0, .EXACT});
+                            push_unsafe(&class_stack, Character{'\a', 0, .EXACT});
 
                         case 'b': // backspace
-                            push(&class_stack, Character{'\b', 0, .EXACT});
+                            push_unsafe(&class_stack, Character{'\b', 0, .EXACT});
 
                         case 't': // tab
-                            push(&class_stack, Character{'\t', 0, .EXACT});
+                            push_unsafe(&class_stack, Character{'\t', 0, .EXACT});
 
                         case 'r': // carriage return
-                            push(&class_stack, Character{'\r', 0, .EXACT});
+                            push_unsafe(&class_stack, Character{'\r', 0, .EXACT});
 
                         case 'f': // form feed
-                            push(&class_stack, Character{'\f', 0, .EXACT});
+                            push_unsafe(&class_stack, Character{'\f', 0, .EXACT});
 
                         case 'n': // new line
-                            push(&class_stack, Character{'\n', 0, .EXACT});
+                            push_unsafe(&class_stack, Character{'\n', 0, .EXACT});
 
                         case 'e': // escape
-                            push(&class_stack, Character{'\e', 0, .EXACT});
+                            push_unsafe(&class_stack, Character{'\e', 0, .EXACT});
 
                         case:
-                            push(&class_stack, Character{current_rune, 0, .EXACT});
+                            push_unsafe(&class_stack, Character{current_rune, 0, .EXACT});
                     }
             }
         }
 
-        push(&token_stack, Token{Character{')', 0, .NON_MATCHING}, token_stack.head, 0});
-        push(&token_stack, Token{Character{'#', 0, .EXACT}, token_stack.head, name_accept});
+        // concat ")#" to the end of the regex where '#' has the region name "accept"
+        push_unsafe(&token_stack, Token{Character{')', 0, .NON_MATCHING}, token_stack.head, 0});
+        push_unsafe(&token_stack, Token{Character{'#', 0, .EXACT}, token_stack.head, to_region32("accept")});
 
         if DEBUG do fmt.println("Lexing finished!");
     }
 
     regex_length = token_stack.head;
-    tokens := token_stack.elements[0 : regex_length];
+    tokens := #no_bounds_check token_stack.elements[0 : regex_length];
 
     // double the length to account for the implicit concat(.) operator
     max_nodes := regex_length * 2;
     max_operands := regex_length;
 
-    nodes := make_stack(Node, max_nodes);
+    nodes := make_temp_stack(Node, max_nodes);
 
-    rpn := make_stack(^Node, max_nodes);
-    ops := make_stack(^Node, regex_length);
-
-    operands := make_stack(^Node, max_operands);
-    eval := make_stack(^Node, max_nodes);
+    rpn := make_temp_stack(^Node, max_nodes);
 
     { // parsing
         if DEBUG do fmt.println("Parsing started!");
+
+        ops := make_temp_stack(^Node, regex_length);
 
         shunting_yard :: proc(using current_node :^Node, rpn :^Stack(^Node), ops :^Stack(^Node))
         {
             switch
             {
                 case precedence == .OPERAND:
-                    push(rpn, current_node);
+                    push_unsafe(rpn, current_node);
 
                 case precedence == .OPAREN:
-                    push(ops, current_node);
+                    push_unsafe(ops, current_node);
 
                 case precedence == .ALTERN
                 || precedence == .CONCAT
                 || precedence == .UNARY:
                     for
                     {
-                        if ops.head == 0 || precedence > peek(ops).precedence
+                        if ops.head == 0 || precedence > peek_unsafe(ops).precedence
                         {
-                            push(ops, current_node);
+                            push_unsafe(ops, current_node);
                             break;
                         }
                         else
                         {
-                            push(rpn, pop(ops));
+                            push_unsafe(rpn, pop_unsafe(ops));
                         }
                     }
 
                 case precedence == .CLOPAREN:
                     for
                     {
-                        if peek(ops).precedence != .OPAREN
+                        if peek_unsafe(ops).precedence != .OPAREN
                         {
-                            push(rpn, pop(ops));
+                            push_unsafe(rpn, pop_unsafe(ops));
                         }
                         else
                         {
-                            pop(ops);
+                            pop_unsafe(ops);
                             break;
                         }
                     }
@@ -563,7 +558,7 @@ compile_regex :: proc(regex :string) -> (table :[]Table_Entry)
 
         for i := 0; i < regex_length; i += 1
         {
-            current_token := &tokens[i];
+            current_token := #no_bounds_check &tokens[i];
 
             // compute from last precedence value if a concat should be inserted
             l_concatable := precedence == .OPERAND || precedence == .UNARY || precedence == .CLOPAREN;
@@ -612,31 +607,35 @@ compile_regex :: proc(regex :string) -> (table :[]Table_Entry)
             // should a concat be inserted?
             if l_concatable && r_concatable
             {
-                push(&nodes, CONCAT_NODE);
-                shunting_yard(peek_pointer(&nodes), &rpn, &ops);
+                push_unsafe(&nodes, CONCAT_NODE);
+                shunting_yard(peek_pointer_unsafe(&nodes), &rpn, &ops);
             }
 
-            push(&nodes, current_node);
-            shunting_yard(peek_pointer(&nodes), &rpn, &ops);
+            push_unsafe(&nodes, current_node);
+            shunting_yard(peek_pointer_unsafe(&nodes), &rpn, &ops);
         }
 
         for ops.head != 0
         {
-            push(&rpn, pop(&ops));
+            push_unsafe(&rpn, pop_unsafe(&ops));
         }
 
         if DEBUG do fmt.println("Parsing finished!");
     }
 
+    operands := make_temp_stack(^Node, max_operands);
+
     { // symbolic evaluation
         if DEBUG do fmt.println("Symbolic evaluation started!");
+
+        eval := make_temp_stack(^Node, max_nodes);
 
         compute_follow_pos :: proc(first_pos :[]^Node, leaves :[]^Node)
         {
             length := len(leaves);
             for i := 0; i < length; i += 1
             {
-                leaf := leaves[i];
+                leaf := #no_bounds_check leaves[i];
 
                 leaf.follow_pos = marry_slices(first_pos, leaf.follow_pos);
             }
@@ -648,10 +647,10 @@ compile_regex :: proc(regex :string) -> (table :[]Table_Entry)
             lenlr := lenl + lenr;
             out = make([]T, lenlr, context.temp_allocator);
 
-            outl := out[0 : lenl];
+            outl := #no_bounds_check out[0 : lenl];
             runtime.copy_slice(out, left);
 
-            outr := out[lenl : lenlr];
+            outr := #no_bounds_check out[lenl : lenlr];
             runtime.copy_slice(outr, right);
 
             return;
@@ -659,7 +658,7 @@ compile_regex :: proc(regex :string) -> (table :[]Table_Entry)
 
         for i := 0; i < rpn.head; i += 1
         {
-            using current_node := rpn.elements[i];
+            using current_node := #no_bounds_check rpn.elements[i];
 
             #partial switch precedence
             {
@@ -667,18 +666,18 @@ compile_regex :: proc(regex :string) -> (table :[]Table_Entry)
                     nullable = false;
 
                     first_pos = make([]^Node, 1, context.temp_allocator);
-                    first_pos[0] = current_node;
+                    #no_bounds_check first_pos[0] = current_node;
 
                     last_pos = make([]^Node, 1, context.temp_allocator);
-                    last_pos[0] = current_node;
+                    #no_bounds_check last_pos[0] = current_node;
 
                     position = operands.head;
 
-                    push(&operands, current_node);
-                    push(&eval, current_node);
+                    push_unsafe(&operands, current_node);
+                    push_unsafe(&eval, current_node);
 
                 case .UNARY:
-                    middle_node := pop(&eval);
+                    middle_node := pop_unsafe(&eval);
 
                     first_pos = middle_node.first_pos;
                     last_pos = middle_node.last_pos;
@@ -700,10 +699,10 @@ compile_regex :: proc(regex :string) -> (table :[]Table_Entry)
 
                     }
 
-                    push(&eval, current_node);
+                    push_unsafe(&eval, current_node);
 
                 case .ALTERN:
-                    right_node, left_node := pop(&eval), pop(&eval);
+                    right_node, left_node := pop_unsafe(&eval), pop_unsafe(&eval);
 
                     nullable = left_node.nullable || right_node.nullable;
 
@@ -713,10 +712,10 @@ compile_regex :: proc(regex :string) -> (table :[]Table_Entry)
                     last_pos = marry_slices(left_node.last_pos, last_pos);
                     last_pos = marry_slices(right_node.last_pos, last_pos);
 
-                    push(&eval, current_node);
+                    push_unsafe(&eval, current_node);
 
                 case .CONCAT:
-                    right_node, left_node := pop(&eval), pop(&eval);
+                    right_node, left_node := pop_unsafe(&eval), pop_unsafe(&eval);
 
                     nullable = left_node.nullable && right_node.nullable;
 
@@ -742,51 +741,89 @@ compile_regex :: proc(regex :string) -> (table :[]Table_Entry)
 
                     compute_follow_pos(right_node.first_pos, left_node.last_pos);
 
-                    push(&eval, current_node);
+                    push_unsafe(&eval, current_node);
             }
         }
 
         if DEBUG do fmt.println("Symbolic evaluation finished!");
     }
 
-    // TODO: make the table generation format the table in memory in a way that's easy to free
+    operand_count, transition_count, character_count, total_size :int;
+
+    { // calculate state machine size
+        if DEBUG do fmt.println("Calculating size of table started!");
+
+        total_operand_size, total_transition_size, total_character_size :int;
+
+        operand_count = operands.head;
+        for i := 0; i < operand_count; i += 1
+        {
+            operand := #no_bounds_check operands.elements[i];
+            temp_transition_count := len(operand.follow_pos);
+            transition_count += temp_transition_count;
+            for k := 0; k < temp_transition_count; k += 1
+            {
+                transition := #no_bounds_check operand.follow_pos[k];
+                character_value := transition.token.character_value;
+                if character_class, ok := character_value.(Character_Class); ok
+                {
+                    character_count += len(character_class.characters);
+                }
+            }
+        }
+
+        total_size = operand_count * size_of(Table_Entry) + transition_count * size_of(Transition) + character_count * size_of(Character);
+
+        if DEBUG do fmt.println("Calculating size of tables finished! Table is", total_size, "bytes wide!");
+    }
+
     { // table generation
         if DEBUG do fmt.println("Table generation started!");
 
-        table = make([]Table_Entry, operands.head);
+        // allocate the memory for the state machine and define the distinct regions of the state machine
+        regex_arena := cast(^Table_Entry)mem.alloc(size_of(u8) * total_size, 64);
+        transition_arena := cast(^Transition)mem.ptr_offset(regex_arena, operand_count);
+        character_arena := cast(^Character)mem.ptr_offset(transition_arena, transition_count);
+
+        table = mem.slice_ptr(regex_arena, operand_count);
+        table_stack := Stack(Table_Entry){0, table};
+        transition_stack := Stack(Transition){0, mem.slice_ptr(transition_arena, transition_count)};
+        character_stack := Stack(Character){0, mem.slice_ptr(character_arena, character_count)};
 
         for i := 0; i < operands.head; i += 1
         {
-            operand := operands.elements[i];
+            operand := #no_bounds_check operands.elements[i];
 
-            table[i] = make_table_entry(len(operand.follow_pos));
+            transitions_start := transition_stack.head;
 
-            for jump, index in operand.follow_pos
+            num_jumps := len(operand.follow_pos);
+            for k := 0; k < num_jumps; k += 1
             {
-                transition := &table[i].transitions[index];
-                jump_token := jump.token;
+                jump := #no_bounds_check operand.follow_pos[k];
 
-                transition.jump = jump.position;
-                transition.condition = jump_token^;
-
-                #partial switch character_value in transition.condition.character_value
+                character_value := jump.token.character_value;
+                if character_class, ok := character_value.(Character_Class); ok
                 {
-                    case Character_Class:
-                        class_length := len(character_value.characters);
-                        temp_slice := make([]Character, class_length);
-                        runtime.copy_slice(temp_slice, character_value.characters);
-                        
-                        negated := character_value.negated;
+                    characters_start := character_stack.head;
 
-                        transition.condition.character_value = Character_Class{temp_slice, negated};
+                    for character in character_class.characters
+                    {
+                        push_unsafe(&character_stack, character);
+                    }
+
+                    character_value = Character_Class{#no_bounds_check character_stack.elements[characters_start : character_stack.head], character_class.negated};
                 }
+
+                push_unsafe(&transition_stack, Transition{character_value, jump.position, jump.token.region_name});
             }
+
+            push_unsafe(&table_stack, Table_Entry{#no_bounds_check transition_stack.elements[transitions_start : transition_stack.head]});
         }
 
         if DEBUG do fmt.println("Table generation finished!");
     }
 
-    if DEBUG
+    if DEBUG && false
     {
         print_character :: proc(character :Character)
         {
@@ -832,6 +869,10 @@ compile_regex :: proc(regex :string) -> (table :[]Table_Entry)
                             || min_rune == '.' do fmt.print('\\');
                             fmt.print(min_rune);
                     }
+
+                case .NON_MATCHING:
+                    fmt.print(min_rune);
+
                 case:
                     if min_rune != '.' do fmt.print('\\');
                     fmt.print(min_rune);
@@ -895,6 +936,20 @@ compile_regex :: proc(regex :string) -> (table :[]Table_Entry)
             fmt.print(']');
         }
 
+        fmt.println("\nRegex:\n");
+        for i := 0; i < token_stack.head; i += 1
+        {
+            switch character_value in token_stack.elements[i].character_value
+            {
+                case Character:
+                    print_character(character_value);
+
+                case Character_Class:
+                    print_character_class(character_value);
+            }
+        }
+        fmt.println(); fmt.println();
+
         fmt.println("RPN:\n");
         for i := 0; i < rpn.head; i += 1
         {
@@ -940,7 +995,7 @@ compile_regex :: proc(regex :string) -> (table :[]Table_Entry)
         {
             token := operands.elements[index].token;
             temp_name := token.region_name;
-            name := from_b32(temp_name);
+            name := from_region32(temp_name);
 
             fmt.print(index, ' ');
             switch character_value in token.character_value
@@ -954,9 +1009,8 @@ compile_regex :: proc(regex :string) -> (table :[]Table_Entry)
 
             for transition in entry.transitions
             {
-                condition := transition.condition;
                 fmt.print("    ");
-                switch character_value in condition.character_value
+                switch character_value in transition.character_value
                 {
                     case Character:
                         print_character(character_value);
@@ -976,16 +1030,7 @@ match :: proc(regex :^[]Table_Entry, index :int, character :rune) -> (new_index 
 {
     is_number :: proc(character :rune) -> bool
     {
-        return character == '0'
-        || character == '1'
-        || character == '2'
-        || character == '3'
-        || character == '4'
-        || character == '5'
-        || character == '6'
-        || character == '7'
-        || character == '8'
-        || character == '9';
+        return character >= '0' && character <= '9';
     }
 
     is_vertical_whitespace :: proc(character :rune) -> bool
@@ -993,15 +1038,15 @@ match :: proc(regex :^[]Table_Entry, index :int, character :rune) -> (new_index 
         return character >= '\u000A' && character <= '\u000D' || character == '\u2028' || character == '\u2029';
     }
 
-    is_match :: proc(condition :Character, character :rune) -> bool
+    is_match :: proc(character_value :^Character, character :rune) -> bool
     {
-        #partial switch condition.type
+        #partial switch character_value.type
         {
             case .EXACT:
-                return character == condition.min_rune;
+                return character == character_value.min_rune;
 
             case .RANGE:
-                return character >= condition.min_rune && character <= condition.max_rune;
+                return character >= character_value.min_rune && character <= character_value.max_rune;
 
             case .NUM:
                 return is_number(character);
@@ -1055,27 +1100,25 @@ match :: proc(regex :^[]Table_Entry, index :int, character :rune) -> (new_index 
 
     for i := 0; i < num_entries; i += 1
     {
-        transition := entry.transitions[i];
+        transition := #no_bounds_check &entry.transitions[i];
 
         jump := transition.jump;
-        region_name := transition.condition.region_name;
+        region_name := transition.region_name;
 
-        switch character_value in transition.condition.character_value
+        switch character_value in &transition.character_value
         {
             case Character:
                 if is_match(character_value, character) do return jump, region_name, true;
 
             case Character_Class:
-                characters := character_value.characters;
+                characters := &character_value.characters;
                 num_characters := len(characters);
 
                 negated := character_value.negated;
 
                 for k := 0; k < num_characters; k += 1
                 {
-                    condition := characters[k];
-                    matched := is_match(condition, character);
-                    if !negated && matched || negated && !matched do return jump, region_name, true;
+                    if negated != is_match(#no_bounds_check &characters[k], character) do return jump, region_name, true;
                 }
         }
     }
@@ -1087,29 +1130,31 @@ match :: proc(regex :^[]Table_Entry, index :int, character :rune) -> (new_index 
     return index, 0, false;
 }
 
-DEBUG :: false;
+DEBUG :: true;
 
 main :: proc()
 {
-    iter :i64 = 1000;
+    iter :i64 = 1_000_000;
     if DEBUG do iter = 1;
 
-    if !DEBUG // 10k wide regex
+    //if !DEBUG // 10k wide regex
     { 
         start := time.now();
 
         for i :i64 = 0; i < iter; i += 1
         {
-            compile_regex("((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)");
+            regex := compile_regex(`((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)((abc(def|ghi(jkl|mnop)))+(zabc(def|ghi(jkl|mnop)))+)`);
+            defer delete(regex);
         }
 
         end := time.now();
         total := (end._nsec - start._nsec)/iter;
-        fmt.println("\n\nDid not crash. Ran for", total, "ns /", cast(f32)total/1_000_000, "ms.\n\n");
+        fmt.println("\n\nDid not crash. Ran for an average of", total, "ns /", cast(f32)total/1_000_000, "ms.\n\n");
     }
 
     { // matching
-        regex := compile_regex("abc((def|[ghi])*|( \\w+)+\\. and this is to go even further beyond.)");
+        regex := compile_regex(`abc((def|[ghi])*|( [a-zA-Z0-9_]+)+\. and this is to go even further beyond\.)`);
+        defer delete(regex);
 
         start := time.now();
 
@@ -1128,26 +1173,27 @@ main :: proc()
 
         end := time.now();
         total := (end._nsec - start._nsec)/iter;
-        fmt.println("\n\nDid not crash. Ran for", total, "ns /", cast(f32)total/1_000_000, "ms.\n\n");
+        fmt.println("\n\nDid not crash. Ran for an average of", total, "ns /", cast(f32)total/1_000_000, "ms.\n\n");
     }
 
-    regex := compile_regex("{nest:my {ing:super }nested {ed:regex} engine}");
+    regex := compile_regex(`{nest:my {ing:super }nested {ed:regex }engine}`);
+    defer delete(regex);
 
     test_input := "my super nested regex engine#";
 
     index := 0;
     region :u128;
     ok :bool;
-    nest := make_stack(rune, 50);
-    ing := make_stack(rune, 50);
-    ed := make_stack(rune, 50);
+    nest := make_temp_stack(rune, 50);
+    ing := make_temp_stack(rune, 50);
+    ed := make_temp_stack(rune, 50);
     for character in test_input
     {
         index, region, ok = match(&regex, index, character);
-        if region == to_b32("nest") do push(&nest, character);
-        if region == to_b32("ing") do push(&ing, character);
-        if region == to_b32("ed") do push(&ed, character);
-        if region == to_b32("accept") do fmt.println("\nInput accepted.");
+        if region == to_region32("nest") do push(&nest, character);
+        if region == to_region32("ing") do push(&ing, character);
+        if region == to_region32("ed") do push(&ed, character);
+        if region == to_region32("accept") do fmt.println("\nInput accepted.");
     }
 
     fmt.println();
